@@ -1,0 +1,30 @@
+{
+  "author": "jimmytai <jimmytai@ionexenergy.com>",
+  "license": "MIT",
+  "main": "index.js",
+  "name": "amiibo-bins",
+  "repository": "git@github.com:taichunmin/amiibo-bins.git",
+  "type": "module",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node ./build.mjs",
+    "lint": "eslint --ext .js,.mjs,.cjs --fix ."
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "crypto-js": "^4.1.1",
+    "dotenv": "^16.0.3",
+    "fast-glob": "^3.2.12",
+    "js-yaml": "^4.1.0",
+    "lodash": "^4.17.21",
+    "pn532.js": "^0.1.18"
+  },
+  "devDependencies": {
+    "eslint": "^8.40.0",
+    "eslint-config-standard": "^17.0.0",
+    "eslint-plugin-import": "^2.27.5",
+    "eslint-plugin-n": "^16.0.0",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^6.1.1"
+  }
+}
