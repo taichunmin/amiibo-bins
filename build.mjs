@@ -1,12 +1,12 @@
 import _ from 'lodash'
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import axios from 'axios'
 import CryptoJS from 'crypto-js'
 import fg from 'fast-glob'
 import jsyaml from 'js-yaml'
 import Packet from 'pn532.js/Packet.js'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 const basedir = new URL('./', import.meta.url)
 const distDir = new URL('./dist/', import.meta.url)
@@ -62,7 +62,7 @@ async function build () {
       })
 
       await Promise.all([
-        copyOrWriteBinToDist(tag.pack, `./ntag215/${relative}`), // ntag215 files
+        copyOrWriteBinToDist(tag.encrypted, `./ntag215/${relative}`), // ntag215 files
         copyOrWriteBinToDist(tag.toAmiitool(), `./amiitool/${relative}`), // amiitool files
       ])
     } catch (err) {
@@ -224,7 +224,6 @@ const RETAIL_KEY = Packet.fromBase64('HRZLN1typVcouR1ktqPCBXVuZml4ZWQgaW5mb3MAAA
 class AmiiboNtag215 {
   constructor () {
     this.pack = new Packet(540) // encrypted
-    this.decrypted = null
     this.keys = null
   }
 
@@ -233,7 +232,7 @@ class AmiiboNtag215 {
     const tag = new AmiiboNtag215()
     tag.pack.set(input) // clone
     tag.fixPwd() // because pwd can not be read from NTAG215, so we need to regenerate
-    tag.encryptIfSign2Invalid()
+    tag.pack = tag.encrypted
     return tag
   }
 
@@ -244,9 +243,9 @@ class AmiiboNtag215 {
   static fromAmiitool (amiitool) {
     if (!Packet.isLen(amiitool)) throw new TypeError('amiitool should be instance of Packet')
     if (!_.includes([520, 540], amiitool.length)) throw new TypeError(`invalid amiitool.length = ${amiitool?.length}`)
-    const { concatFromByteMaps, fromNtag215 } = AmiiboNtag215
+    const tag = new AmiiboNtag215()
     // https://github.com/socram8888/amiitool/blob/master/amiibo.c#L63
-    const pack = concatFromByteMaps(amiitool, [ // Don't change the order
+    tag.pack = AmiiboNtag215.concatFromByteMaps(amiitool, [ // Don't change the order
       [0x1D4, 0x008], // NTAG215 UID
       [0x000, 0x008], // Lock/CC
       [0x028, 0x024], // 0x28: Counter, 0x2A: Init Date, 0x2C: Modified Date, 0x2E: Hash?, 0x34: Console #, 0x38: Nickname
@@ -256,7 +255,19 @@ class AmiiboNtag215 {
       [0x04C, 0x168], // 0x04C: Mii, 0x0B4: Write Counter, 0x0B6: App ID, 0x0BC: Hash, 0x0DC: App Data
       [0x208, 0x014], // Dynamic Lock Bytes, MIRROR, ACCESS, PWD, PACK
     ])
-    return fromNtag215(pack)
+    return tag
+  }
+
+  static fromAmiiboId (amiiboId) {
+    if (!_.isString(amiiboId) || amiiboId.length !== 16) throw new TypeError(`invalid amiiboId: ${amiiboId}`)
+    const tag = new AmiiboNtag215()
+    tag.randomUid() // 0x000-0x008: uid, bcc0, bcc1
+    // 0x054-0x05B: AmiiboId
+    tag.pack.set(Packet.fromHex(amiiboId), 0x054)
+    // 0x060-0x07F: Keygen Salt
+    tag.pack.set(AmiiboNtag215.randomBytes(32), 0x060)
+    tag.fixTag()
+    return tag
   }
 
   static fromNtag215OrAmiitool (input) {
@@ -285,8 +296,6 @@ class AmiiboNtag215 {
     if (retail[31] === 16) seed.set(retail.subarray(32, 48), 16) // 16 magic bytes
     else seed.set(retail.subarray(32, 46), 18) // 14 magic bytes
     for (let i = 0; i < 32; i++) seed[48 + i] ^= retail[48 + i] // xorPad
-    // - console.log(`retail = ${retail.base64url}`)
-    // - console.log(`seed = ${seed.base64url}`)
     const res = {}
     if (retail[31] === 14) [res.aesKey, res.aesIv] = hs256(seed, retail.subarray(0, 16)).chunk(16)
     seed[1] = 1
@@ -323,6 +332,10 @@ class AmiiboNtag215 {
     return pwd
   }
 
+  static randomBytes (len) {
+    return Packet.fromWordArray(CryptoJS.lib.WordArray.random(len))
+  }
+
   get uid () { return AmiiboNtag215.concatFromByteMaps(this.pack, [[0, 3], [4, 4]]) }
   get setting () { return this.pack.subarray(0x10, 0x34) } // Tag setting
   get sign1 () { return this.pack.subarray(0x34, 0x54) } // Tag HS256
@@ -354,22 +367,24 @@ class AmiiboNtag215 {
 
   get parsedAppDataConfig () {
     if (!this.hasAppData) return undefined
-    if (!this.decrypted) this.generateDecrypted()
     return {
-      appId: this.decrypted.getUint32(182, false),
-      counter: this.decrypted.getUint16(180, false),
+      appId: this.pack.getUint32(182, false),
+      counter: this.pack.getUint16(180, false),
       // Amiibo module writes hard-coded uint8_t value 0xD8 here. This is the size of the Amiibo AppData, apps can use this with the AppData R/W commands. ...
-      data: this.decrypted.subarray(220, 436), // [0xDC, 0xDC + 0xD8]
-      titleId: this.decrypted.subarray(172, 180), // BigUint64
+      data: this.pack.subarray(220, 436), // [0xDC, 0xDC + 0xD8]
+      titleId: this.pack.subarray(172, 180), // BigUint64
       unk: this.flag >>> 4,
     }
   }
 
+  get encrypted () {
+    return this.encryptOrDecrypt(this.pack)
+  }
+
   toAmiitool () {
     const { concatFromByteMaps } = AmiiboNtag215
-    if (!this.decrypted) this.generateDecrypted()
     // https://github.com/socram8888/amiitool/blob/master/amiibo.c#L53
-    return concatFromByteMaps(this.decrypted, [ // Don't change the order
+    return concatFromByteMaps(this.pack, [ // Don't change the order
       [0x008, 0x008], // Lock/CC
       [0x080, 0x020], // UNFIXED_INFOS HS256
       [0x010, 0x024], // 0x10: Counter, 0x12: Init Date, 0x14: Modified Date, 0x16: Hash?, 0x1C: Console #, 0x20: Nickname
@@ -417,17 +432,13 @@ class AmiiboNtag215 {
     ]
     const payload = concatFromByteMaps(input, encryptByteMaps)
     const encrypted = aes128Ctr(payload, aesKey, aesIv)
-    const output = new Packet(input)
+    const output = input.slice()
     let offset1 = 0
     for (const [offset2, len] of encryptByteMaps) {
       output.set(encrypted.subarray(offset1, offset1 + len), offset2)
       offset1 += len
     }
     return output
-  }
-
-  generateDecrypted () {
-    this.decrypted = this.encryptOrDecrypt(this.pack)
   }
 
   isValidSign1 () {
@@ -437,10 +448,10 @@ class AmiiboNtag215 {
     return sign1.isEqual(this.sign1)
   }
 
-  isValidSign2 (packToValidate = this.decrypted) {
+  isValidSign2 () {
     const { calcSign2 } = AmiiboNtag215
     if (!this.keys) this.generateKeys()
-    const sign2 = calcSign2(packToValidate, this.keys)
+    const sign2 = calcSign2(this.pack, this.keys)
     return sign2.isEqual(this.sign2)
   }
 
@@ -451,17 +462,8 @@ class AmiiboNtag215 {
   }
 
   isValid () {
-    if (!this.decrypted) this.generateDecrypted()
     // console.log(`isValid = ${JSON.stringify([this.isValidPwd(), this.isValidSign1(), this.isValidSign2()])}`)
     return this.isValidPwd() && this.isValidSign1() && this.isValidSign2()
-  }
-
-  encryptIfSign2Invalid () {
-    if (!this.decrypted) this.generateDecrypted()
-    if (this.isValidSign2()) return true // no need to encrypt
-    if (!this.isValidSign2(this.pack)) return false // both sign2 invalid
-    ;[this.pack, this.decrypted] = [this.decrypted, this.pack] // swap
-    return true
   }
 
   fixPwd () {
@@ -472,24 +474,21 @@ class AmiiboNtag215 {
 
   fixSignature () {
     const { calcSign1, calcSign2 } = AmiiboNtag215
-    if (!this.decrypted) this.generateDecrypted(true) // no validate sign2
-    this.sign1.set(calcSign1(this.decrypted, this.keys))
-    this.sign2.set(calcSign2(this.decrypted, this.keys))
+    this.pack.set(calcSign1(this.pack, this.keys), 0x34) // sign1
+    this.pack.set(calcSign2(this.pack, this.keys), 0x80) // sign2
   }
 
   fixUid () {
+    this.pack[0] = 0x04 // uid0 = NXP (0x04)
     this.pack[3] = this.pack.subarray(0, 3).xor ^ 0x88 // bcc0 = CT (0x88) ^ uid0 ^ uid1 ^ uid2
     this.pack[8] = this.pack.subarray(4, 8).xor // bcc1 = uid3 ^ uid4 ^ uid5 ^ uid6
   }
 
   fixData () {
-    // Set blank tag?
-    // https://github.com/HiddenRamblings/TagMo/blob/master/app/src/main/java/com/hiddenramblings/tagmo/nfctech/TagReader.kt#L17
-    this.pack.set(Packet.fromHex('0FE0'), 0x00A)
-    // Set 0xA5, Write Counter, and Unknown
-    this.pack.set(Packet.fromHex('A5000000'), 0x010)
-    // Set Dynamic Lock, and RFUI, CFG0, CFG1
-    // https://github.com/HiddenRamblings/TagMo/blob/master/app/src/main/java/com/hiddenramblings/tagmo/nfctech/Foomiibo.kt#L43
+    // https://gitlab.com/tagmo/amiibo-generator/-/blob/android/script.js#L98
+    // 0x009-0x014: Internal, Static Lock, CC, 0xA5, two bytes for write counter, unknown byte
+    this.pack.set(Packet.fromHex('480FE0F110FFEEA5000000'), 0x009)
+    // 0x208-0x213: Dynamic Lock, RFUI, CFG0, CFG1
     this.pack.set(Packet.fromHex('01000FBD000000045F000000'), 0x208)
   }
 
@@ -498,23 +497,20 @@ class AmiiboNtag215 {
     this.fixData() // fix static data
     this.fixPwd() // re-generate pwd
     this.generateKeys() // re-generate keys
-    this.generateDecrypted() // re-generate decrypted
     this.fixSignature() // fix sign1, sign2
   }
 
   setUid (uid7b) {
+    // You need to handle encryption/decryption yourself
     if (!Packet.isLen(uid7b, 7)) throw new TypeError('invalid uid7b')
     if (uid7b[0] !== 0x04) throw new TypeError('uid7b[0] should be NXP (0x04)')
-
-    if (!this.decrypted) this.generateDecrypted() // decrypt
-
-    this.uid.set(uid7b.subarray(0, 3), 0)
-    this.uid.set(uid7b.subarray(3, 7), 4)
-    this.fixTag()
+    this.pack.set(uid7b.subarray(0, 3), 0)
+    this.pack.set(uid7b.subarray(3, 7), 4)
+    this.fixUid()
   }
 
   randomUid () {
-    const uid7b = Packet.fromWordArray(CryptoJS.lib.WordArray.random(7))
+    const uid7b = AmiiboNtag215.randomBytes(7)
     uid7b[0] = 0x04
     this.setUid(uid7b)
   }
